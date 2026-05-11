@@ -28,7 +28,10 @@ class AICampusQACrawler:
         output_file="sustech_qa_pairs.jsonl",
         raw_output_file="sustech_raw_documents.jsonl",
         model="deepseek-chat",
-        delay=1.0
+        delay=1.0,
+        skip_existing_urls=True,
+        skip_existing_questions=True,
+        skip_duplicate_content=True
     ):
         self.user_requirement = user_requirement
         self.allowed_domains = allowed_domains or []
@@ -44,6 +47,10 @@ class AICampusQACrawler:
         self.model = model
         self.delay = delay
 
+        self.skip_existing_urls = skip_existing_urls
+        self.skip_existing_questions = skip_existing_questions
+        self.skip_duplicate_content = skip_duplicate_content
+
         self.client = OpenAI(
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com"
@@ -53,8 +60,10 @@ class AICampusQACrawler:
             "User-Agent": "Mozilla/5.0 (Educational AI Crawler Demo)"
         }
 
+        # 单次运行 + 历史文件加载后的去重集合
         self.visited_urls = set()
         self.saved_questions = set()
+        self.saved_doc_hashes = set()
 
     # =========================
     # 通用工具函数
@@ -104,7 +113,7 @@ class AICampusQACrawler:
 
     def save_jsonl(self, file_path, record):
         """
-        保存 JSONL 文件。
+        追加保存 JSONL 文件。
         """
         with open(file_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -113,7 +122,38 @@ class AICampusQACrawler:
         """
         根据文本生成稳定 ID。
         """
+        text = str(text)
         return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+    def normalize_url(self, url):
+        """
+        简单规范化 URL。
+        """
+        if not url:
+            return ""
+
+        url = url.strip()
+        url = url.split("#")[0]
+        url = url.rstrip("/")
+        return url
+
+    def normalize_question(self, question):
+        """
+        规范化问题文本，用于问题去重。
+        """
+        question = str(question).strip()
+        question = re.sub(r"\s+", "", question)
+        question = question.replace("？", "?")
+        return question
+
+    def get_content_hash(self, content):
+        """
+        根据正文内容生成 hash。
+        只取前 8000 字符，避免超长文本导致处理过慢。
+        """
+        content = str(content).strip()
+        content = re.sub(r"\s+", "", content)
+        return self.make_id(content[:8000])
 
     def domain_allowed(self, url):
         """
@@ -125,13 +165,62 @@ class AICampusQACrawler:
 
         return any(domain in url for domain in self.allowed_domains)
 
-    def normalize_url(self, url):
+    # =========================
+    # 读取历史文件，实现跨运行去重
+    # =========================
+
+    def load_existing_jsonl(self, file_path):
         """
-        简单规范化 URL。
+        读取已有 JSONL 文件。
         """
-        url = url.strip()
-        url = url.split("#")[0]
-        return url
+        records = []
+
+        if not os.path.exists(file_path):
+            return records
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f, start=1):
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    print(f"[Warning] JSONL 第 {line_idx} 行解析失败，已跳过：{file_path}")
+                    continue
+
+        return records
+
+    def load_existing_state(self):
+        """
+        从已有 raw_documents 和 qa_pairs 文件中加载历史去重信息。
+        """
+        raw_records = self.load_existing_jsonl(self.raw_output_file)
+
+        for record in raw_records:
+            url = record.get("url", "").strip()
+            if url:
+                self.visited_urls.add(self.normalize_url(url))
+
+            content = record.get("content", "").strip()
+            if content:
+                self.saved_doc_hashes.add(self.get_content_hash(content))
+
+        qa_records = self.load_existing_jsonl(self.output_file)
+
+        for record in qa_records:
+            question = record.get("question", "").strip()
+            if question:
+                normalized_question = self.normalize_question(question)
+                self.saved_questions.add(self.make_id(normalized_question))
+
+        print(f"[Loaded existing state] 历史 raw documents: {len(raw_records)} 条")
+        print(f"[Loaded existing state] 历史 QA pairs: {len(qa_records)} 条")
+        print(f"[Loaded existing state] 已记录历史 URL: {len(self.visited_urls)} 个")
+        print(f"[Loaded existing state] 已记录历史 content hash: {len(self.saved_doc_hashes)} 个")
+        print(f"[Loaded existing state] 已记录历史 question hash: {len(self.saved_questions)} 个")
 
     # =========================
     # AI 生成搜索关键词
@@ -181,7 +270,12 @@ class AICampusQACrawler:
             "南方科技大学 学生事务 办事指南",
             "南方科技大学 Blackboard 校园网",
             "南方科技大学 学生公寓管理细则",
-            "南方科技大学 校医院 医保 就诊"
+            "南方科技大学 校医院 医保 就诊",
+            "南方科技大学 食堂 营业时间",
+            "南方科技大学 学生事务中心 成绩单",
+            "南方科技大学 校园网 使用指南",
+            "南方科技大学 本科生管理规定",
+            "南方科技大学 学籍管理规定"
         ]
 
         for kw in default_keywords:
@@ -306,7 +400,7 @@ class AICampusQACrawler:
             ):
                 return self.extract_docx_text(resp.content, url)
 
-            # 有些 DOCX/PDF 的 content-type 可能不标准，尝试按后缀处理
+            # 老式 .doc 暂不处理
             if url_lower.endswith(".doc"):
                 print(f"[Skip DOC] 暂不支持 .doc 文件：{url}")
                 return None, None
@@ -395,7 +489,7 @@ class AICampusQACrawler:
                 if text:
                     paragraphs.append(text)
 
-            # 也尝试读取表格内容
+            # 尝试读取表格内容
             for table in document.tables:
                 for row in table.rows:
                     cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
@@ -522,7 +616,10 @@ class AICampusQACrawler:
     # =========================
 
     def run(self):
-        print("Step 1: DeepSeek 正在根据需求生成搜索关键词...")
+        # 关键新增：先读取历史文件，避免重复爬取和重复写入
+        self.load_existing_state()
+
+        print("\nStep 1: DeepSeek 正在根据需求生成搜索关键词...")
         keywords = self.generate_search_keywords()
 
         print("\n生成的搜索关键词：")
@@ -545,7 +642,8 @@ class AICampusQACrawler:
 
                 url = self.normalize_url(url)
 
-                if url in self.visited_urls:
+                if self.skip_existing_urls and url in self.visited_urls:
+                    print(f"  -> 跳过历史 URL：{url}")
                     continue
 
                 if not self.domain_allowed(url):
@@ -560,6 +658,7 @@ class AICampusQACrawler:
                 )
 
                 if judge.get("relevant") is True:
+                    item["url"] = url
                     item["ai_reason"] = judge.get("reason", "")
                     item["ai_category"] = judge.get("category", "other")
                     candidate_urls.append(item)
@@ -573,41 +672,50 @@ class AICampusQACrawler:
         for url in self.seed_urls:
             url = self.normalize_url(url)
 
-            if self.domain_allowed(url):
-                candidate_urls.append({
-                    "title": "Seed URL",
-                    "url": url,
-                    "snippet": "",
-                    "ai_reason": "人工指定入口",
-                    "ai_category": "seed"
-                })
+            if not self.domain_allowed(url):
+                continue
 
-        # URL 去重
+            if self.skip_existing_urls and url in self.visited_urls:
+                print(f"  -> 跳过历史 seed URL：{url}")
+                continue
+
+            candidate_urls.append({
+                "title": "Seed URL",
+                "url": url,
+                "snippet": "",
+                "ai_reason": "人工指定入口",
+                "ai_category": "seed"
+            })
+
+        # 候选 URL 去重
         unique_candidates = []
         seen_urls = set()
 
         for item in candidate_urls:
-            url = item["url"]
-            if url not in seen_urls:
+            url = self.normalize_url(item["url"])
+            if url and url not in seen_urls:
+                item["url"] = url
                 unique_candidates.append(item)
                 seen_urls.add(url)
 
         candidate_urls = unique_candidates
 
-        print(f"\nStep 3: 筛选后得到 {len(candidate_urls)} 个候选网页 / 文件。")
+        print(f"\nStep 3: 筛选后得到 {len(candidate_urls)} 个新的候选网页 / 文件。")
 
         crawled_count = 0
+        skipped_duplicate_content_count = 0
         total_qa_count = 0
 
         for item in tqdm(candidate_urls, desc="Crawling and generating QA"):
             if crawled_count >= self.max_pages:
                 break
 
-            url = item["url"]
+            url = self.normalize_url(item["url"])
 
-            if url in self.visited_urls:
+            if self.skip_existing_urls and url in self.visited_urls:
                 continue
 
+            # 先加入，避免本次运行重复处理同一 URL
             self.visited_urls.add(url)
 
             title, content = self.fetch_content(url)
@@ -615,11 +723,21 @@ class AICampusQACrawler:
             if not content or len(content) < 200:
                 continue
 
+            content_hash = self.get_content_hash(content)
+
+            if self.skip_duplicate_content and content_hash in self.saved_doc_hashes:
+                print(f"[Skip duplicate content] {url}")
+                skipped_duplicate_content_count += 1
+                continue
+
+            self.saved_doc_hashes.add(content_hash)
+
             raw_record = {
                 "doc_id": self.make_id(url),
                 "url": url,
                 "title": title,
                 "content": content,
+                "content_hash": content_hash,
                 "content_length": len(content),
                 "ai_category": item.get("ai_category", "other"),
                 "ai_reason": item.get("ai_reason", ""),
@@ -646,10 +764,10 @@ class AICampusQACrawler:
                     if not question:
                         continue
 
-                    # 问题去重
-                    question_id = self.make_id(question)
+                    normalized_question = self.normalize_question(question)
+                    question_id = self.make_id(normalized_question)
 
-                    if question_id in self.saved_questions:
+                    if self.skip_existing_questions and question_id in self.saved_questions:
                         continue
 
                     self.saved_questions.add(question_id)
@@ -670,8 +788,9 @@ class AICampusQACrawler:
             time.sleep(self.delay)
 
         print("\n完成。")
-        print(f"成功处理网页 / 文件数量：{crawled_count}")
-        print(f"生成 QA 对数量：{total_qa_count}")
+        print(f"新处理网页 / 文件数量：{crawled_count}")
+        print(f"跳过重复内容数量：{skipped_duplicate_content_count}")
+        print(f"新增 QA 对数量：{total_qa_count}")
         print(f"原始网页数据保存到：{self.raw_output_file}")
         print(f"QA 对保存到：{self.output_file}")
 
@@ -694,6 +813,10 @@ if __name__ == "__main__":
 10. 新生攻略
 11. 办事指南
 12. 教学管理规定
+13. 学籍管理
+14. 成绩单
+15. 体育课和体测
+16. 校园服务
 
 要求：
 1. 优先使用南方科技大学官网、学生手册、书院官网、图书馆官网、教学工作部、学生事务、官方通知等公开信息。
@@ -721,12 +844,17 @@ if __name__ == "__main__":
         ],
         max_search_keywords=30,
         max_urls_per_keyword=20,
-        max_pages=200,
+        max_pages=1000,
         max_qa_per_chunk=10,
         output_file="sustech_qa_pairs.jsonl",
         raw_output_file="sustech_raw_documents.jsonl",
         model="deepseek-chat",
-        delay=1.0
+        delay=1.0,
+
+        # 这三个参数控制历史去重
+        skip_existing_urls=True,
+        skip_existing_questions=True,
+        skip_duplicate_content=True
     )
 
     crawler.run()
