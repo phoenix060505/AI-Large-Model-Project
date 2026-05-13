@@ -1,0 +1,8 @@
+{
+  "data_path": "/root/AI-Large-Model-Project/sustech_qa_pairs.jsonl",
+  "embedding_model": "/root/autodl-tmp/models/Qwen/Qwen3-Embedding-0___6B",
+  "num_items": 1700,
+  "dimension": 1024,
+  "index_type": "faiss.IndexFlatIP",
+  "note": "Embeddings are L2-normalized, inner product equals cosine similarity."
+}
